@@ -34,6 +34,7 @@ import ffmpeg
 from dotenv import load_dotenv
 import structlog
 import aiofiles
+import httpx
 
 # Load environment variables
 load_dotenv()

@@ -4,6 +4,7 @@ import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import { logger } from '../utils/logger.js';
 import { ValidationError, UnauthorizedError } from '../middleware/errorHandler.js';
+import { databaseService } from '../services/databaseService.js';
 
 const router = express.Router();
 
@@ -18,17 +19,6 @@ const registerSchema = z.object({
   password: z.string().min(6, 'Password must be at least 6 characters'),
   role: z.enum(['admin', 'operator', 'viewer']).optional().default('viewer')
 });
-
-// Temporary in-memory user store (replace with database in production)
-const users = [
-  {
-    id: 1,
-    username: 'admin',
-    password: '$2a$10$N9qo8uLOickgx2ZMRZoMyeqJGGhCLOEpEL5GiE8/B0/LlQVGb8.Bm', // 'admin123'
-    role: 'admin',
-    createdAt: new Date().toISOString()
-  }
-];
 
 /**
  * @swagger
@@ -102,16 +92,19 @@ router.post('/login', async (req, res, next) => {
     const { username, password } = validationResult.data;
 
     // Find user
-    const user = users.find(u => u.username === username);
+    const user = await databaseService.getUserByUsername(username);
     if (!user) {
       throw new UnauthorizedError('Invalid credentials');
     }
 
     // Verify password
-    const isValidPassword = await bcrypt.compare(password, user.password);
+    const isValidPassword = await bcrypt.compare(password, user.password_hash);
     if (!isValidPassword) {
       throw new UnauthorizedError('Invalid credentials');
     }
+
+    // Update last login
+    await databaseService.updateUserLastLogin(user.id);
 
     // Generate JWT token
     const tokenPayload = {
@@ -200,7 +193,7 @@ router.post('/register', async (req, res, next) => {
     const { username, password, role } = validationResult.data;
 
     // Check if user already exists
-    const existingUser = users.find(u => u.username === username);
+    const existingUser = await databaseService.getUserByUsername(username);
     if (existingUser) {
       return res.status(409).json({
         error: {
@@ -212,18 +205,17 @@ router.post('/register', async (req, res, next) => {
 
     // Hash password
     const saltRounds = 10;
-    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    const password_hash = await bcrypt.hash(password, saltRounds);
 
     // Create new user
-    const newUser = {
-      id: users.length + 1,
+    const userData = {
       username,
-      password: hashedPassword,
-      role,
-      createdAt: new Date().toISOString()
+      email: `${username}@autonews.com`, // Generate email from username
+      password_hash,
+      role
     };
 
-    users.push(newUser);
+    const newUser = await databaseService.createUser(userData);
 
     logger.info('User registered successfully', {
       userId: newUser.id,
@@ -237,7 +229,7 @@ router.post('/register', async (req, res, next) => {
         id: newUser.id,
         username: newUser.username,
         role: newUser.role,
-        createdAt: newUser.createdAt
+        createdAt: newUser.created_at
       }
     });
 

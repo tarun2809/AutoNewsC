@@ -3,7 +3,10 @@ import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../utils/logger.js';
 import { ValidationError, NotFoundError } from '../middleware/errorHandler.js';
-import { incrementJobMetric } from '../routes/metrics.js';
+import { incrementJobMetric } from './metrics.js';
+import { databaseService } from '../services/databaseService.js';
+import { gnewsService } from '../services/gnewsService.js';
+import { youtubeService } from '../services/youtubeService.js';
 
 const router = express.Router();
 
@@ -27,9 +30,6 @@ const jobFiltersSchema = z.object({
   page: z.number().min(1).optional().default(1),
   limit: z.number().min(1).max(100).optional().default(20)
 });
-
-// In-memory job store (replace with database in production)
-const jobs = [];
 
 /**
  * @swagger
@@ -186,19 +186,22 @@ router.post('/', async (req, res, next) => {
       createdBy: req.user.id
     };
 
-    jobs.push(job);
+    // Save job to database
+    const savedJob = await databaseService.createJob(job);
     incrementJobMetric('created');
 
     logger.info('Job created', {
-      jobId: job.id,
-      topic: job.topic,
+      jobId: savedJob.id,
+      topic: savedJob.topic,
       userId: req.user.id
     });
 
-    // TODO: Queue job for processing
-    // await queueJob(job);
+    // Start job processing in background
+    processJobAsync(savedJob).catch(error => {
+      logger.error('Job processing failed', { jobId: savedJob.id, error: error.message });
+    });
 
-    res.status(201).json(job);
+    res.status(201).json(savedJob);
 
   } catch (error) {
     next(error);
@@ -288,43 +291,24 @@ router.get('/', async (req, res, next) => {
     }
 
     const filters = validationResult.data;
-    let filteredJobs = [...jobs];
-
-    // Apply filters
-    if (filters.status) {
-      filteredJobs = filteredJobs.filter(job => job.status === filters.status);
-    }
     
-    if (filters.topic) {
-      filteredJobs = filteredJobs.filter(job => 
-        job.topic.toLowerCase().includes(filters.topic.toLowerCase())
-      );
-    }
+    // Get jobs from database
+    const dbFilters = {
+      status: filters.status,
+      topic: filters.topic,
+      date_from: filters.date_from,
+      date_to: filters.date_to,
+      limit: filters.limit,
+      offset: (filters.page - 1) * filters.limit
+    };
     
-    if (filters.date_from) {
-      filteredJobs = filteredJobs.filter(job => 
-        new Date(job.createdAt) >= new Date(filters.date_from)
-      );
-    }
-    
-    if (filters.date_to) {
-      filteredJobs = filteredJobs.filter(job => 
-        new Date(job.createdAt) <= new Date(filters.date_to)
-      );
-    }
-
-    // Sort by creation date (newest first)
-    filteredJobs.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-
-    // Pagination
-    const total = filteredJobs.length;
+    const jobs = await databaseService.getJobs(dbFilters);
+    const totalJobs = await databaseService.getJobs({ ...dbFilters, limit: null, offset: null });
+    const total = totalJobs.length;
     const totalPages = Math.ceil(total / filters.limit);
-    const startIndex = (filters.page - 1) * filters.limit;
-    const endIndex = startIndex + filters.limit;
-    const paginatedJobs = filteredJobs.slice(startIndex, endIndex);
 
     res.json({
-      jobs: paginatedJobs,
+      jobs,
       pagination: {
         page: filters.page,
         limit: filters.limit,
@@ -368,11 +352,15 @@ router.get('/', async (req, res, next) => {
 router.get('/:id', async (req, res, next) => {
   try {
     const jobId = req.params.id;
-    const job = jobs.find(j => j.id === jobId);
+    const job = await databaseService.getJobById(jobId);
 
     if (!job) {
       throw new NotFoundError('Job not found');
     }
+
+    // Get associated articles
+    const articles = await databaseService.getArticlesByJobId(jobId);
+    job.articles = articles;
 
     res.json(job);
 
@@ -409,7 +397,7 @@ router.get('/:id', async (req, res, next) => {
 router.post('/:id/publish', async (req, res, next) => {
   try {
     const jobId = req.params.id;
-    const job = jobs.find(j => j.id === jobId);
+    const job = await databaseService.getJobById(jobId);
 
     if (!job) {
       throw new NotFoundError('Job not found');
@@ -424,7 +412,7 @@ router.post('/:id/publish', async (req, res, next) => {
       });
     }
 
-    if (!job.artifacts.video) {
+    if (!job.artifacts || !job.artifacts.video) {
       return res.status(400).json({
         error: {
           message: 'No video available for publishing',
@@ -433,26 +421,42 @@ router.post('/:id/publish', async (req, res, next) => {
       });
     }
 
-    // TODO: Implement YouTube publishing
-    // const publishResult = await publishToYouTube(job);
+    // Publish to YouTube
+    const publishResult = await youtubeService.publishJobVideo(
+      job,
+      job.artifacts.video,
+      job.artifacts.thumbnail
+    );
 
-    // Update job status
-    job.updatedAt = new Date().toISOString();
-    const publishStep = job.steps.find(step => step.name === 'publish');
-    if (publishStep) {
-      publishStep.status = 'completed';
-      publishStep.startedAt = new Date().toISOString();
-      publishStep.completedAt = new Date().toISOString();
-    }
+    // Update job with publish step
+    const updatedSteps = job.steps.map(step => {
+      if (step.name === 'publish') {
+        return {
+          ...step,
+          status: 'completed',
+          startedAt: new Date().toISOString(),
+          completedAt: new Date().toISOString()
+        };
+      }
+      return step;
+    });
+
+    await databaseService.updateJob(jobId, {
+      steps: updatedSteps,
+      youtube_url: publishResult.videoUrl,
+      youtube_video_id: publishResult.videoId
+    });
 
     logger.info('Job published to YouTube', {
       jobId: job.id,
+      videoUrl: publishResult.videoUrl,
       userId: req.user.id
     });
 
     res.json({
       message: 'Job published successfully',
-      job
+      videoUrl: publishResult.videoUrl,
+      videoId: publishResult.videoId
     });
 
   } catch (error) {
@@ -486,18 +490,20 @@ router.post('/:id/publish', async (req, res, next) => {
 router.delete('/:id', async (req, res, next) => {
   try {
     const jobId = req.params.id;
-    const jobIndex = jobs.findIndex(j => j.id === jobId);
+    const job = await databaseService.getJobById(jobId);
 
-    if (jobIndex === -1) {
+    if (!job) {
       throw new NotFoundError('Job not found');
     }
-
-    const job = jobs[jobIndex];
 
     // TODO: Clean up artifacts (files, etc.)
     // await cleanupJobArtifacts(job);
 
-    jobs.splice(jobIndex, 1);
+    const deleted = await databaseService.deleteJob(jobId);
+    
+    if (!deleted) {
+      throw new Error('Failed to delete job');
+    }
 
     logger.info('Job deleted', {
       jobId: job.id,
@@ -510,5 +516,81 @@ router.delete('/:id', async (req, res, next) => {
     next(error);
   }
 });
+
+// Background job processing function
+async function processJobAsync(job) {
+  try {
+    logger.info('Starting job processing', { jobId: job.id });
+    
+    // Update job status to running
+    await databaseService.updateJob(job.id, {
+      status: 'running',
+      started_at: new Date().toISOString()
+    });
+
+    // Step 1: Fetch news articles
+    await updateJobStep(job.id, 'fetch_news', 'running');
+    const articles = await gnewsService.fetchArticlesForJob(job);
+    await updateJobStep(job.id, 'fetch_news', 'completed');
+
+    if (articles.length === 0) {
+      throw new Error('No articles found for the specified topic/keywords');
+    }
+
+    // Step 2: Summarize content (call NLP service)
+    await updateJobStep(job.id, 'summarize', 'running');
+    // TODO: Call summarization service
+    await updateJobStep(job.id, 'summarize', 'completed');
+
+    // Step 3: Generate audio (call TTS service)
+    await updateJobStep(job.id, 'generate_audio', 'running');
+    // TODO: Call TTS service
+    await updateJobStep(job.id, 'generate_audio', 'completed');
+
+    // Step 4: Create video (call Video service)
+    await updateJobStep(job.id, 'create_video', 'running');
+    // TODO: Call video generation service
+    await updateJobStep(job.id, 'create_video', 'completed');
+
+    // Update job as completed
+    await databaseService.updateJob(job.id, {
+      status: 'completed',
+      completed_at: new Date().toISOString(),
+      processing_time: (Date.now() - new Date(job.created_at).getTime()) / 1000
+    });
+
+    incrementJobMetric('completed');
+    logger.info('Job processing completed successfully', { jobId: job.id });
+
+  } catch (error) {
+    logger.error('Job processing failed', { jobId: job.id, error: error.message });
+    
+    await databaseService.updateJob(job.id, {
+      status: 'failed',
+      error_message: error.message,
+      completed_at: new Date().toISOString()
+    });
+
+    incrementJobMetric('failed');
+  }
+}
+
+async function updateJobStep(jobId, stepName, status) {
+  const job = await databaseService.getJobById(jobId);
+  const updatedSteps = job.steps.map(step => {
+    if (step.name === stepName) {
+      const now = new Date().toISOString();
+      return {
+        ...step,
+        status,
+        startedAt: status === 'running' ? now : step.startedAt,
+        completedAt: status === 'completed' ? now : step.completedAt
+      };
+    }
+    return step;
+  });
+
+  await databaseService.updateJob(jobId, { steps: updatedSteps });
+}
 
 export default router;

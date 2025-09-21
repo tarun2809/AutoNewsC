@@ -1,5 +1,9 @@
 import express from 'express';
 import { logger } from '../utils/logger.js';
+import { databaseService } from '../services/databaseService.js';
+import { gnewsService } from '../services/gnewsService.js';
+import { youtubeService } from '../services/youtubeService.js';
+import axios from 'axios';
 
 const router = express.Router();
 
@@ -73,11 +77,11 @@ router.get('/', async (req, res) => {
     // Check database health
     try {
       const dbStart = Date.now();
-      // TODO: Add actual database health check
-      // await db.raw('SELECT 1');
+      const stats = await databaseService.getJobStats();
       healthCheck.services.database = {
         status: 'healthy',
-        latency: Date.now() - dbStart
+        latency: Date.now() - dbStart,
+        totalJobs: stats.total
       };
     } catch (error) {
       healthCheck.services.database = {
@@ -90,11 +94,16 @@ router.get('/', async (req, res) => {
     // Check NLP service health
     try {
       const nlpStart = Date.now();
-      // TODO: Add actual NLP service health check
-      // const response = await axios.get(`${process.env.NLP_SERVICE_URL}/health`);
+      const response = await axios.get(`${process.env.NLP_SERVICE_URL}/health`, {
+        timeout: 5000,
+        headers: {
+          'Authorization': `Bearer ${process.env.INTERNAL_SERVICE_SECRET}`
+        }
+      });
       healthCheck.services.nlp_service = {
-        status: 'healthy',
-        latency: Date.now() - nlpStart
+        status: response.data.status === 'healthy' ? 'healthy' : 'degraded',
+        latency: Date.now() - nlpStart,
+        model_loaded: response.data.model_loaded
       };
     } catch (error) {
       healthCheck.services.nlp_service = {
@@ -107,11 +116,16 @@ router.get('/', async (req, res) => {
     // Check TTS service health
     try {
       const ttsStart = Date.now();
-      // TODO: Add actual TTS service health check
-      // const response = await axios.get(`${process.env.TTS_SERVICE_URL}/health`);
+      const response = await axios.get(`${process.env.TTS_SERVICE_URL}/health`, {
+        timeout: 5000,
+        headers: {
+          'Authorization': `Bearer ${process.env.INTERNAL_SERVICE_SECRET}`
+        }
+      });
       healthCheck.services.tts_service = {
-        status: 'healthy',
-        latency: Date.now() - ttsStart
+        status: response.data.status === 'healthy' ? 'healthy' : 'degraded',
+        latency: Date.now() - ttsStart,
+        model_loaded: response.data.model_loaded
       };
     } catch (error) {
       healthCheck.services.tts_service = {
@@ -124,11 +138,16 @@ router.get('/', async (req, res) => {
     // Check Video service health
     try {
       const videoStart = Date.now();
-      // TODO: Add actual Video service health check
-      // const response = await axios.get(`${process.env.VIDEO_SERVICE_URL}/health`);
+      const response = await axios.get(`${process.env.VIDEO_SERVICE_URL}/health`, {
+        timeout: 5000,
+        headers: {
+          'Authorization': `Bearer ${process.env.INTERNAL_SERVICE_SECRET}`
+        }
+      });
       healthCheck.services.video_service = {
-        status: 'healthy',
-        latency: Date.now() - videoStart
+        status: response.data.status === 'healthy' ? 'healthy' : 'degraded',
+        latency: Date.now() - videoStart,
+        ffmpeg_available: response.data.ffmpeg_available
       };
     } catch (error) {
       healthCheck.services.video_service = {
@@ -137,6 +156,25 @@ router.get('/', async (req, res) => {
       };
       healthCheck.status = 'degraded';
     }
+
+    // Check external API health
+    try {
+      const gnewsValid = await gnewsService.validateApiKey();
+      healthCheck.services.gnews_api = {
+        status: gnewsValid ? 'healthy' : 'unhealthy',
+        configured: Boolean(process.env.GNEWS_API_KEY)
+      };
+    } catch (error) {
+      healthCheck.services.gnews_api = {
+        status: 'unhealthy',
+        error: error.message
+      };
+    }
+
+    healthCheck.services.youtube_api = {
+      status: youtubeService.isConfigured() ? 'healthy' : 'not_configured',
+      configured: youtubeService.isConfigured()
+    };
 
     const statusCode = healthCheck.status === 'healthy' ? 200 : 503;
     res.status(statusCode).json(healthCheck);

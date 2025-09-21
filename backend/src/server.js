@@ -12,6 +12,8 @@ import { logger } from './utils/logger.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { requestId } from './middleware/requestId.js';
 import { validateAuth } from './middleware/auth.js';
+import { initializeDatabase } from './database/migrate.js';
+import { databaseService } from './services/databaseService.js';
 
 // Import routes
 import jobsRouter from './routes/jobs.js';
@@ -24,6 +26,16 @@ import { initializeCronJobs } from './cron/index.js';
 
 // Load environment variables
 dotenv.config();
+
+// Initialize database
+try {
+  initializeDatabase();
+  databaseService.initialize();
+  logger.info('Database initialized successfully');
+} catch (error) {
+  logger.error('Failed to initialize database', error);
+  process.exit(1);
+}
 
 const app = express();
 const PORT = process.env.PORT || 3001;
