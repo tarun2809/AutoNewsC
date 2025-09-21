@@ -1,0 +1,148 @@
+version: '3.8'
+
+services:
+  # Database
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: autonews
+      POSTGRES_USER: autonews
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-autonews123}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autonews"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for caching
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Backend Service
+  backend:
+    build: ./backend
+    environment:
+      - NODE_ENV=development
+      - PORT=8000
+      - DATABASE_URL=postgresql://autonews:${POSTGRES_PASSWORD:-autonews123}@postgres:5432/autonews
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET:-your-jwt-secret-key}
+      - GNEWS_API_KEY=${GNEWS_API_KEY}
+      - YOUTUBE_API_KEY=${YOUTUBE_API_KEY}
+      - SUMMARIZER_SERVICE_URL=http://summarizer:8001
+      - TTS_SERVICE_URL=http://tts-service:8002
+      - VIDEO_SERVICE_URL=http://video-pipeline:8003
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-internal-secret-123}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    command: npm run dev
+
+  # Summarizer Service
+  summarizer:
+    build: ./nlp-audio/summarizer
+    environment:
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-internal-secret-123}
+      - MODEL_CACHE_DIR=/app/models
+      - HUGGINGFACE_CACHE_DIR=/app/hf_cache
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./nlp-audio/summarizer:/app
+      - summarizer_models:/app/models
+      - hf_cache:/app/hf_cache
+    command: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+
+  # TTS Service
+  tts-service:
+    build: ./nlp-audio/tts-service
+    environment:
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-internal-secret-123}
+      - MODEL_CACHE_DIR=/app/models
+      - HUGGINGFACE_CACHE_DIR=/app/hf_cache
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./nlp-audio/tts-service:/app
+      - tts_models:/app/models
+      - hf_cache:/app/hf_cache
+    command: uvicorn main:app --host 0.0.0.0 --port 8002 --reload
+
+  # Video Pipeline Service
+  video-pipeline:
+    build: ./video-pipeline
+    environment:
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-internal-secret-123}
+      - TEMP_DIR=/app/temp
+      - FFMPEG_PATH=/usr/bin/ffmpeg
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./video-pipeline:/app
+      - video_temp:/app/temp
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8003 --reload
+
+  # Frontend
+  frontend:
+    build: 
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_ENV=development
+      - CHOKIDAR_USEPOLLING=true
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: npm start
+    stdin_open: true
+    tty: true
+
+  # Nginx (for production-like setup)
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - backend
+      - frontend
+    profiles:
+      - production
+
+volumes:
+  postgres_data:
+  redis_data:
+  summarizer_models:
+  tts_models:
+  hf_cache:
+  video_temp:
+
+networks:
+  default:
+    name: autonews-network

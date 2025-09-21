@@ -1,0 +1,272 @@
+name: AutoNews CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  NODE_VERSION: '20'
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  # Backend Tests
+  backend-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: backend/package-lock.json
+    
+    - name: Install backend dependencies
+      run: |
+        cd backend
+        npm ci
+    
+    - name: Run backend linting
+      run: |
+        cd backend
+        npm run lint
+    
+    - name: Run backend tests
+      run: |
+        cd backend
+        npm run test:coverage
+    
+    - name: Upload backend coverage
+      uses: codecov/codecov-action@v3
+      with:
+        file: backend/coverage/lcov.info
+        flags: backend
+
+  # NLP Services Tests
+  nlp-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install summarizer dependencies
+      run: |
+        cd nlp-audio/summarizer
+        pip install -r requirements.txt
+    
+    - name: Test summarizer service
+      run: |
+        cd nlp-audio/summarizer
+        python -m pytest tests/ -v --cov=main --cov-report=xml
+    
+    - name: Install TTS dependencies
+      run: |
+        cd nlp-audio/tts-service
+        pip install -r requirements.txt
+    
+    - name: Test TTS service
+      run: |
+        cd nlp-audio/tts-service
+        python -m pytest tests/ -v --cov=main --cov-report=xml
+
+  # Video Pipeline Tests
+  video-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
+    
+    - name: Install video pipeline dependencies
+      run: |
+        cd video-pipeline
+        pip install -r requirements.txt
+    
+    - name: Test video pipeline service
+      run: |
+        cd video-pipeline
+        python -m pytest tests/ -v --cov=src --cov-report=xml
+
+  # Frontend Tests
+  frontend-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+    
+    - name: Install frontend dependencies
+      run: |
+        cd frontend
+        npm ci
+    
+    - name: Run frontend linting
+      run: |
+        cd frontend
+        npm run lint
+    
+    - name: Run frontend tests
+      run: |
+        cd frontend
+        npm run test -- --coverage --watchAll=false
+    
+    - name: Build frontend
+      run: |
+        cd frontend
+        npm run build
+
+  # Build and Deploy Backend
+  deploy-backend:
+    needs: [backend-test]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: backend/package-lock.json
+    
+    - name: Install dependencies
+      run: |
+        cd backend
+        npm ci --only=production
+    
+    - name: Deploy to Railway
+      uses: railway-deploy@v2
+      with:
+        railway-token: ${{ secrets.RAILWAY_TOKEN }}
+        service: autonews-backend
+        
+  # Deploy NLP Services
+  deploy-nlp:
+    needs: [nlp-test]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Deploy Summarizer to Hugging Face Spaces
+      run: |
+        # Clone the Hugging Face Spaces repo
+        git clone https://${{ secrets.HF_USERNAME }}:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/${{ secrets.HF_USERNAME }}/autonews-summarizer
+        
+        # Copy files
+        cp -r nlp-audio/summarizer/* autonews-summarizer/
+        
+        # Push to Hugging Face
+        cd autonews-summarizer
+        git add .
+        git commit -m "Update summarizer service"
+        git push
+    
+    - name: Deploy TTS Service to Render
+      uses: render-deploy@v1
+      with:
+        service-id: ${{ secrets.RENDER_TTS_SERVICE_ID }}
+        api-key: ${{ secrets.RENDER_API_KEY }}
+
+  # Deploy Video Pipeline
+  deploy-video:
+    needs: [video-test]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Deploy Video Pipeline to Render
+      uses: render-deploy@v1
+      with:
+        service-id: ${{ secrets.RENDER_VIDEO_SERVICE_ID }}
+        api-key: ${{ secrets.RENDER_API_KEY }}
+
+  # Deploy Frontend
+  deploy-frontend:
+    needs: [frontend-test]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+    
+    - name: Install and build
+      run: |
+        cd frontend
+        npm ci
+        npm run build
+    
+    - name: Deploy to Vercel
+      uses: vercel/action@v1
+      with:
+        vercel-token: ${{ secrets.VERCEL_TOKEN }}
+        vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+        vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+        working-directory: frontend
+
+  # Integration Tests
+  integration-test:
+    needs: [deploy-backend, deploy-nlp, deploy-video, deploy-frontend]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+    
+    - name: Install test dependencies
+      run: |
+        npm install -g newman
+    
+    - name: Run API integration tests
+      run: |
+        newman run tests/postman/AutoNews-API.postman_collection.json \
+          --environment tests/postman/production.postman_environment.json \
+          --reporters cli,junit --reporter-junit-export results.xml
+    
+    - name: Run E2E tests
+      run: |
+        cd frontend
+        npm run test:e2e:ci

@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: autonews-tts-service
+    runtime: python3
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: false
+    envVars:
+      - key: INTERNAL_API_SECRET
+        sync: false
+      - key: MODEL_CACHE_DIR
+        value: /tmp/models
+      - key: HUGGINGFACE_CACHE_DIR
+        value: /tmp/hf_cache
